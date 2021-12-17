@@ -1,0 +1,259 @@
+% dc1 = dual network fusion, configuration 1 (alexnet + vgg16)
+
+for(k=1:1)
+
+clear
+
+imds = imageDatastore('/home/titan/Documents/Fusion Images/GT',...
+    'IncludeSubfolders', true, ...
+    'LabelSource', 'foldernames');
+
+imds2 = imageDatastore('/home/titan/Documents/Fusion Images/NF',...
+    'IncludeSubfolders', true, ...
+    'LabelSource', 'foldernames');
+
+imds = shuffle(imds);
+imds2 = shuffle(imds2);
+
+tbl = countEachLabel(imds);
+tbl2 = countEachLabel(imds2);
+
+% numImgs = 40;
+imdsTrimmed = imds;
+imdsTrimmed2 = imdsTrimmed;
+
+imdsTrimmed3 = imds2;
+imdsTrimmed4 = imdsTrimmed3;
+
+% Alexnet and vgg16/19 use different sized input images.
+% Use splitEachLabel method to trim two sets, for Alexnet and VGG based nets.
+imdsTrimmed.ReadFcn = @(filename)readAndPreprocessImageA(filename);
+
+[s1, x] = size(imdsTrimmed.Files);
+[imdsTrainA] = splitEachLabel(imdsTrimmed,tbl.Count(1),'randomized');
+
+imdsTrimmed2.ReadFcn = @(filename)readAndPreprocessImageV(filename);
+[s2, x] = size(imdsTrimmed2.Files);
+[imdsTrainV] = splitEachLabel(imdsTrimmed2,tbl.Count(1),'randomized');
+
+imdsTrimmed3.ReadFcn = @(filename)readAndPreprocessImageA(filename);
+[s3, x] = size(imdsTrimmed3.Files);
+[imdsTestA] = splitEachLabel(imdsTrimmed3,tbl2.Count(1),'randomized');
+
+imdsTrimmed4.ReadFcn = @(filename)readAndPreprocessImageV(filename);
+[s4, x] = size(imdsTrimmed4.Files);
+[imdsTestV] = splitEachLabel(imdsTrimmed4,tbl2.Count(1),'randomized');
+
+% select three pretrained networks
+net1 = alexnet;
+net2 = vgg16;
+net3 = vgg19;
+
+
+tic;
+disp("Extracting Features");
+
+% set layer to fc7
+layer = 'fc7';
+
+% extract training features from 3 pretrained networks
+featuresTrainA = activations(net1,imdsTrainA,layer,...
+    'MiniBatchSize', 1,'OutputAs','rows',...
+    'ExecutionEnvironment','gpu');
+
+featuresTrainB = activations(net2,imdsTrainV,layer,...
+    'MiniBatchSize', 1,'OutputAs','rows',...
+    'ExecutionEnvironment','gpu');
+
+featuresTrainC = activations(net3,imdsTrainV,layer,...
+    'MiniBatchSize', 1,'OutputAs','rows',...
+    'ExecutionEnvironment','gpu');
+
+featuresFused = (featuresTrainA +featuresTrainB + featuresTrainC)  ;
+[TrainM, TrainN] = size(featuresTrainA);
+
+for(i = 1:numel(featuresTrainA))
+    featuresMax(i) = max(featuresTrainA(i), featuresTrainB(i));
+    featuresMax(i) = max(featuresMax(i), featuresTrainC(i));
+end
+
+featuresMax = reshape(featuresMax, [TrainM, TrainN]);
+
+
+for(i = 1:numel(featuresTrainA))
+    featuresMin(i) = min(featuresTrainA(i), featuresTrainB(i));
+    featuresMin(i) = min(featuresMin(i), featuresTrainC(i));
+end
+
+
+featuresMin = reshape(featuresMin, [TrainM, TrainN]);
+
+for(i = 1:numel(featuresTrainA))
+    featuresAvg(i) = (featuresTrainA(i) + featuresTrainB(i) + featuresTrainC(i) ) / 3;
+end
+featuresAvg = reshape(featuresAvg, [TrainM, TrainN]);
+
+featuresTestA = activations(net1,imdsTestA,layer,...
+    'MiniBatchSize', 1,'OutputAs','rows',...
+    'ExecutionEnvironment','gpu');
+
+test.ReadFcn = @(filename)readAndPreprocessImageV(filename);
+
+featuresTestV1 = activations(net2,imdsTestV,layer,...
+    'MiniBatchSize', 1,'OutputAs','rows',...
+    'ExecutionEnvironment','gpu');
+
+featuresTestV2 = activations(net3,imdsTestV,layer,...
+    'MiniBatchSize', 1,'OutputAs','rows',...
+    'ExecutionEnvironment','gpu');
+
+featuresTestFused = featuresTestA + featuresTestV1 + featuresTestV2;
+
+[TestM, TestN] = size(featuresTestA);
+
+for(i = 1:numel(featuresTestA))
+    featuresTestMax(i) = max(featuresTestA(i), featuresTestV1(i));
+    featuresTestMax(i) = max(featuresTestMax(i), featuresTestV2(i));
+end
+
+featuresTestMax = reshape(featuresTestMax, [TestM, TestN]);
+
+for(i = 1:numel(featuresTestA))
+    featuresTestMin(i) = min(featuresTestA(i), featuresTestV1(i));
+    featuresTestMin(i) = min(featuresTestMin(i), featuresTestV2(i));
+end
+
+featuresTestMin = reshape(featuresTestMin,[TestM, TestN]);
+
+for(i = 1:numel(featuresTestA))
+    featuresTestAvg(i) = (featuresTestA(i) + featuresTestV1(i) + featuresTestV2(i) ) / 3;
+end
+
+featuresTestAvg = reshape(featuresTestAvg,[TestM, TestN]);
+
+
+YTrain = imdsTrainA.Labels;
+YTest = imdsTestA.Labels;
+
+disp("Training SVM from Features");
+
+
+classifier = fitcecoc(featuresFused,YTrain,'Learners', 'Linear', 'Coding', 'onevsall', 'ObservationsIn', 'rows');
+
+classifierMax = fitcecoc(featuresMax,YTrain,'Learners', 'Linear', 'Coding', 'onevsall', 'ObservationsIn', 'rows');
+classifierMin = fitcecoc(featuresMin,YTrain,'Learners', 'Linear', 'Coding', 'onevsall', 'ObservationsIn', 'rows');
+classifierAvg = fitcecoc(featuresAvg,YTrain,'Learners', 'Linear', 'Coding', 'onevsall', 'ObservationsIn', 'rows');
+
+disp("Predictions:GAN&VAE");
+
+disp("Alexnet Features:");
+%% 
+[YPred,scores] = predict(classifier,featuresTestA);
+scores = normalize(scores,'range');
+accuracy1 = YPred == YTest;
+[x1,y1,~,auc1] = perfcurve(accuracy1,scores(:,1),1);
+plot(x1,y1)
+
+
+disp("VGG16 Features:");
+
+[YPred,scores] = predict(classifier,featuresTestV1);
+accuracy2 = YPred == YTest;
+scores = normalize(scores,'range');
+[x1,y1,~,auc1] = perfcurve(accuracy2,scores(:,1),1);
+hold on
+plot(x1,y1)
+
+disp("VGG19 Features:");
+[YPred,scores] = predict(classifier,featuresTestV2);
+accuracy3 = YPred == YTest;
+scores = normalize(scores,'range');
+[x1,y1,~,auc1] = perfcurve(accuracy3,scores(:,1),1);
+hold on
+plot(x1,y1)
+
+disp("Fused Features(Sum):");
+[YPred,scores] = predict(classifier,featuresTestFused);
+accuracySum = (YPred == YTest);
+scores = normalize(scores,'range');
+[x1,y1,~,auc1] = perfcurve(accuracySum,scores(:,1),1);
+hold on
+plot(x1,y1)
+
+disp("Fused Features(Max):");
+[YPred,scores] = predict(classifierMax,featuresTestMax);
+accuracyMax = (YPred == YTest);
+scores = normalize(scores,'range');
+[x1,y1,~,auc1] = perfcurve(accuracyMax,scores(:,1),1);
+hold on
+plot(x1,y1)
+
+disp("Fused Features(Min):");
+[YPred,scores] = predict(classifierMin,featuresTestMin);
+accuracyMin = (YPred == YTest);
+scores = normalize(scores,'range');
+[x1,y1,~,auc1] = perfcurve(accuracyMin,scores(:,2),1);
+hold on
+plot(x1,y1)
+
+disp("Fused Features(Avg):");
+[YPred,scores] = predict(classifierAvg,featuresTestAvg);
+accuracyAvg = (YPred == YTest);
+scores = normalize(scores,'range');
+[x1,y1,~,auc1] = perfcurve(accuracyAvg,scores(:,1),1);
+hold on
+plot(x1,y1)
+
+
+%accuracy = [accuracy1, accuracy2, accuracy3];
+%dlmwrite('Results.csv',accuracy,'delimiter',',','-append');
+%fusionAccuracy = [accuracySum, accuracyMax, accuracyMin, accuracyAvg];
+
+t = toc;
+
+% A = [accuracy1, accuracy2, accuracy3, accuracySum, accuracyMax, accuracyMin, accuracyAvg, t];
+
+%dlmwrite('Results.csv',A,'delimiter',',','-append');
+end
+
+function Iout = readAndPreprocessImageA(filename)
+
+        I = imread(filename);
+
+        % Some images may be grayscale. Replicate the image 3 times to
+        % create an RGB image.
+        if ismatrix(I)
+            I = cat(3,I,I,I);
+        end
+
+        % Resize the image as required for Alexnet.
+        Iout = imresize(I, [227 227]);
+
+        % Note that the aspect ratio is not preserved. In Caltech 101, the
+        % object of interest is centered in the image and occupies a
+        % majority of the image scene. Therefore, preserving the aspect
+        % ratio is not critical. However, for other data sets, it may prove
+        % beneficial to preserve the aspect ratio of the original image
+        % when resizing.
+end
+
+function Iout = readAndPreprocessImageV(filename)
+
+        I = imread(filename);
+
+        % Some images may be grayscale. Replicate the image 3 times to
+        % create an RGB image.
+        if ismatrix(I)
+            I = cat(3,I,I,I);
+        end
+
+        % Resize the image as required for VGG.
+        Iout = imresize(I, [224 224]);
+
+        % Note that the aspect ratio is not preserved. In Caltech 101, the
+        % object of interest is centered in the image and occupies a
+        % majority of the image scene. Therefore, preserving the aspect
+        % ratio is not critical. However, for other data sets, it may prove
+        % beneficial to preserve the aspect ratio of the original image
+        % when resizing.
+end
